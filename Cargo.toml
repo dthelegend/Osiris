@@ -1,0 +1,7 @@
+[package]
+name = "osiris"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+osiris-ecs = { path = "osiris-ecs" }
