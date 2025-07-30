@@ -1,31 +1,32 @@
 use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
 use std::any::TypeId;
+use std::marker::PhantomData;
 use std::mem::MaybeUninit;
-use std::ops::Index;
 use std::ptr::NonNull;
-use crate::storage::type_data::{SortedTypeDataArray, TypeData, TypeMetadata};
+use std::ops::{Deref, DerefMut};
+use crate::storage::type_data::TypeMetadata;
 
-pub struct RawTable<const N: usize> {
+pub struct RawTable {
     data: NonNull<u8>,
     capacity: usize,
     // non-owning pointers to the data
-    sorted_type_infos: SortedTypeDataArray<N>,
+    rows: RowInfo,
 }
 
-impl<const N: usize> RawTable<N> {
-    pub fn new(type_infos: [TypeMetadata; N]) -> Self {
+impl RawTable {
+    pub fn new(type_infos: impl IntoIterator<Item = TypeMetadata>) -> Self {
         Self {
             data: NonNull::dangling(),
             capacity: 0,
-            sorted_type_infos: SortedTypeDataArray::new(type_infos)
+            rows: RowInfo::new(type_infos)
         }
     }
 
-    pub unsafe fn from_raw_parts(data: NonNull<u8>, capacity: usize, sorted_type_infos: SortedTypeDataArray<N>) -> Self {
+    pub unsafe fn from_raw_parts(data: NonNull<u8>, capacity: usize, columns: RowInfo) -> Self {
         Self {
             data,
             capacity,
-            sorted_type_infos
+            rows: columns
         }
     }
 
@@ -43,9 +44,9 @@ impl<const N: usize> RawTable<N> {
     fn grow_exact(&mut self, additional_capacity: usize) {
         let mut new_layout = Layout::new::<()>();
         let mut old_layout = Layout::new::<()>();
-        let mut offsets = [0; N];
+        let mut offsets: Box<[usize]> = std::iter::repeat(0).take(self.rows.len()).collect();
 
-        for (TypeData { metadata: TypeMetadata { layout, .. }, .. }, offset) in self.sorted_type_infos.iter().zip(offsets.iter_mut()) {
+        for ((TypeMetadata { layout, .. }, _), offset) in self.rows.iter().zip(offsets.iter_mut()) {
             (new_layout, *offset) = layout.repeat(self.capacity + additional_capacity)
                 .and_then(|(array_layout, _stride)| new_layout.extend(array_layout))
                 .expect("Could not construct new layout");
@@ -53,6 +54,7 @@ impl<const N: usize> RawTable<N> {
                 .expect("Could not construct old layout");
         }
         new_layout = new_layout.pad_to_align();
+        old_layout = old_layout.pad_to_align();
 
         // additional_capacity > 0 therefore, the new layout must be of greater or equal size to the old layout
         debug_assert!(new_layout.size() >= old_layout.size(), "The new layout must be of greater or equal size to the old layout!");
@@ -62,13 +64,13 @@ impl<const N: usize> RawTable<N> {
             if raw_data.is_null() {
                 handle_alloc_error(new_layout);
             }
-            /// SAFETY just checked this invariant
+            // SAFETY just checked this invariant
             unsafe { NonNull::new_unchecked(raw_data) }
         } else {
             new_layout.dangling()
         };
 
-        for (TypeData { metadata: TypeMetadata { layout, .. }, ptr }, offset) in self.sorted_type_infos.iter_mut().zip(offsets.into_iter()).rev() {
+        for (( TypeMetadata { layout, .. }, ptr ), offset) in self.rows.iter_mut().zip(offsets.into_iter()).rev() {
             let ptr_in_new_data = unsafe { new_data.add(offset) };
             unsafe { std::ptr::copy_nonoverlapping(ptr.as_ptr(), ptr_in_new_data.as_ptr(), self.capacity * layout.pad_to_align().size()) };
             *ptr = ptr_in_new_data;
@@ -78,11 +80,11 @@ impl<const N: usize> RawTable<N> {
     }
 
     fn ptr_for_id(&self, type_id: TypeId) -> Option<NonNull<u8>> {
-        self.sorted_type_infos.search_dynamic(type_id).map(|x| x.ptr)
+        self.rows.search_dynamic(type_id).map(|&(_, ptr)| ptr)
     }
 
     fn ptr_for_type<T: 'static>(&self) -> Option<NonNull<u8>> {
-        self.sorted_type_infos.search::<T>().map(|x| x.ptr)
+        self.rows.search::<T>().map(|&(_, ptr)| ptr)
     }
 
     pub fn slice_for_type<T: 'static>(&self) -> Option<&[MaybeUninit<T>]> {
@@ -93,7 +95,93 @@ impl<const N: usize> RawTable<N> {
         self.ptr_for_type::<T>().map(|ptr| unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr() as *mut MaybeUninit<T>, self.capacity) })
     }
 
+    pub unsafe fn at_unchecked(&mut self, idx: usize) -> ColumnPtr {
+        ColumnPtr(
+            PhantomData,
+            self.rows.iter()
+                .map(|(TypeMetadata { layout, .. }, ptr)| ptr.add(layout.pad_to_align().size() * idx))
+                .collect()
+        )
+    }
+
+    pub unsafe fn at(&mut self, idx: usize) -> ColumnPtr {
+        assert!(idx < self.capacity);
+        unsafe { self.at_unchecked(idx) }
+    }
+
     pub fn capacity(&self) -> usize {
         self.capacity
     }
+}
+
+impl Drop for RawTable {
+    fn drop(&mut self) {
+        let mut final_layout = Layout::new::<()>();
+
+        for (TypeMetadata { layout, .. }, .. ) in self.rows.iter() {
+            (final_layout, _) = layout.repeat(self.capacity).and_then(|(array_layout, _stride)| layout.extend(array_layout))
+                .expect("Could not construct old layout");
+        }
+
+        final_layout = final_layout.pad_to_align();
+
+        let data = std::mem::replace(&mut self.data, final_layout.dangling());
+        if final_layout.size() > 0 { unsafe { dealloc(data.as_ptr(), final_layout) } }
+    }
+}
+
+#[repr(transparent)]
+pub struct RowInfo(Box<[(TypeMetadata, NonNull<u8>)]>);
+
+impl RowInfo {
+    pub fn new(mut type_metadata: impl IntoIterator<Item = TypeMetadata>) -> Self {
+        let mut inner: Box<[(TypeMetadata, NonNull<u8>)]> = type_metadata.into_iter().map(|metadata| {
+            let ptr = metadata.layout.dangling();
+            (metadata, ptr)
+        }).collect();
+        inner.sort_unstable_by_key(|(metadata, _)| metadata.id);
+        Self(inner)
+    }
+
+    pub fn search_dynamic(&self, type_id: TypeId) -> Option<&(TypeMetadata, NonNull<u8>)> {
+        self.0.binary_search_by_key(&type_id, |(metadata, ptr)| metadata.id).ok().map(|idx| &self.0[idx])
+    }
+
+    pub fn search<T: 'static>(&self) -> Option<&(TypeMetadata, NonNull<u8>)> {
+        self.search_dynamic(TypeId::of::<T>())
+    }
+}
+
+impl Deref for RowInfo {
+    type Target = [(TypeMetadata, NonNull<u8>)];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for RowInfo {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+// Holding a reference to a column is analogous to holding a reference to it's table
+// ColumnReferences are relatively inexpensive, being only a set of pointers that are guaranteed
+// to be well aligned for the backing type
+#[repr(transparent)]
+pub struct ColumnPtr<'a>(PhantomData<&'a mut RawTable>, Box<[NonNull<u8>]>);
+
+pub trait Bundle {
+    fn metadata() -> BundleMetadata;
+    unsafe fn move_to(self, data: RowInfo);
+}
+
+pub trait BundleRef: Bundle{
+    type RefType;
+    unsafe fn get<'a>(data: &'a RowInfo) -> Self::RefType;
+}
+
+pub trait BundleMut: BundleRef {
+    unsafe fn get_mut<'a>(data: &'a mut RowInfo) -> Self::RefType;
 }

@@ -3,36 +3,22 @@ use frunk::hlist::HList;
 use frunk::{HCons, HNil};
 use std::alloc::GlobalAlloc;
 use std::marker::PhantomData;
-use crate::storage::type_data::{TypeData, TypeMetadata};
+use std::ptr::NonNull;
+use crate::storage::type_data::TypeMetadata;
 
 mod type_data;
 mod raw_table;
 
-// We can't quite type mark this because we need to be able to construct a homogenous list of Tables
-struct Table<const N: usize> {
-    buf: RawTable<N>,
+// We can't quite type mark this because we need to be able to construct a homogenous list of Tables :(
+struct Table {
+    buf: RawTable,
     len: usize,
 }
 
-trait ToMetadataArray<const N: usize> {
-    fn metadata() -> [TypeMetadata; N];
-}
-
-impl ToMetadataArray<0> for HNil {
-    fn metadata() -> [TypeMetadata; 0] { [] }
-}
-
-impl <const N: usize, A: 'static + Sized, B: ToMetadataArray<{ N - 1 }>> ToMetadataArray<N> for HCons<A, B> {
-    fn metadata() -> [TypeMetadata; N] {
-        let mut f = std::iter::once(TypeMetadata::of::<A>()).chain(B::metadata().into_iter());
-        std::array::from_fn(|_| f.next().unwrap())
-    }
-}
-
-impl <const N: usize, A: ToMetadataArray<N>> Table<N> {
-    fn new() -> Self {
+impl Table {
+    fn new(types: impl IntoIterator<Item = TypeMetadata>) -> Self {
         Self {
-            buf: RawTable::new(A::metadata()),
+            buf: RawTable::new(types),
             len: 0,
         }
     }
@@ -40,9 +26,29 @@ impl <const N: usize, A: ToMetadataArray<N>> Table<N> {
     fn reserve(&mut self, capacity: usize) {
         self.buf.reserve(capacity);
     }
+
+    // Add an element to the table
+    unsafe fn push_back_raw_unchecked<Iterable: Iterator<Item = NonNull<u8>>>(&mut self, data: Iterable)
+    where <Iterable as IntoIterator>::IntoIter: ExactSizeIterator {
+        self.buf.reserve(self.len + 1);
+        unsafe {
+            self.buf.write_raw_unchecked(self.len, data);
+        }
+        self.len += 1;
+    }
+    
+    pub fn pop(&mut self) {
+        assert!(self.len > 0);
+        self.len -= 1;
+        unsafe {
+            self.buf.drop_unchecked(self.len);
+        }
+    }
 }
 
-struct Query<const N: usize> {
-    &mut Table
+impl Drop for Table {
+    fn drop(&mut self) {
+        while self.len > 0 { self.pop() }
+    }
 }
 
