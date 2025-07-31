@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 use std::ops::{Deref, DerefMut};
-use crate::storage::type_data::TypeMetadata;
+use crate::storage::type_data::{DynamicBundle, TypeMetadata};
 
 pub struct RawTable {
     data: NonNull<u8>,
@@ -79,35 +79,26 @@ impl RawTable {
         if old_layout.size() > 0 { unsafe { dealloc(old_data.as_ptr(), old_layout); } }
     }
 
-    fn ptr_for_id(&self, type_id: TypeId) -> Option<NonNull<u8>> {
-        self.rows.search_dynamic(type_id).map(|&(_, ptr)| ptr)
+    fn dynamic_row_ptr(&self, type_id: TypeId) -> Option<(TypeMetadata, NonNull<u8>)> {
+        self.rows.search_dynamic(type_id)
     }
 
-    fn ptr_for_type<T: 'static>(&self) -> Option<NonNull<u8>> {
-        self.rows.search::<T>().map(|&(_, ptr)| ptr)
+    // Column-based access is slow and this cost should
+    pub unsafe fn dynamic_assign(&self, idx: usize, bundle: impl DynamicBundle) {
+        bundle.put(|src_ptr, src_id| {
+            if let Some((TypeMetadata { layout, .. }, data_ptr)) = self.dynamic_row_ptr(src_id) {
+                std::ptr::copy(src_ptr, data_ptr.add(layout.pad_to_align().size() * idx).as_ptr(), layout.size());
+            }
+        });
     }
 
-    pub fn slice_for_type<T: 'static>(&self) -> Option<&[MaybeUninit<T>]> {
-        self.ptr_for_type::<T>().map(|ptr| unsafe { std::slice::from_raw_parts(ptr.as_ptr() as *mut MaybeUninit<T>, self.capacity) })
+    pub unsafe fn drop_column(&self, idx: usize) {
+        for (TypeMetadata { layout, drop, .. }, data_ptr) in self.rows.iter() {
+            drop(data_ptr.add(layout.pad_to_align().size() * idx).as_ptr())
+        }
     }
 
-    pub fn mut_slice_for_type<T: 'static>(&self) -> Option<&mut [MaybeUninit<T>]> {
-        self.ptr_for_type::<T>().map(|ptr| unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr() as *mut MaybeUninit<T>, self.capacity) })
-    }
-
-    pub unsafe fn at_unchecked(&mut self, idx: usize) -> ColumnPtr {
-        ColumnPtr(
-            PhantomData,
-            self.rows.iter()
-                .map(|(TypeMetadata { layout, .. }, ptr)| ptr.add(layout.pad_to_align().size() * idx))
-                .collect()
-        )
-    }
-
-    pub unsafe fn at(&mut self, idx: usize) -> ColumnPtr {
-        assert!(idx < self.capacity);
-        unsafe { self.at_unchecked(idx) }
-    }
+    pub unsafe fn swap_columns(&self, idx_a: usize, idx_b: usize) {}
 
     pub fn capacity(&self) -> usize {
         self.capacity
@@ -143,12 +134,16 @@ impl RowInfo {
         Self(inner)
     }
 
-    pub fn search_dynamic(&self, type_id: TypeId) -> Option<&(TypeMetadata, NonNull<u8>)> {
-        self.0.binary_search_by_key(&type_id, |(metadata, ptr)| metadata.id).ok().map(|idx| &self.0[idx])
+    pub fn search_dynamic(&self, type_id: TypeId) -> Option<(TypeMetadata, NonNull<u8>)> {
+        self.0.binary_search_by_key(&type_id, |(metadata, ptr)| metadata.id).ok().map(|idx| self.0[idx])
     }
 
-    pub fn search<T: 'static>(&self) -> Option<&(TypeMetadata, NonNull<u8>)> {
+    pub fn search<T: 'static>(&self) -> Option<(TypeMetadata, NonNull<u8>)> {
         self.search_dynamic(TypeId::of::<T>())
+    }
+
+    pub fn is_equivalent(&self, other: impl IntoIterator<Item=TypeMetadata>) -> bool {
+        other
     }
 }
 
@@ -164,24 +159,4 @@ impl DerefMut for RowInfo {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
-}
-
-// Holding a reference to a column is analogous to holding a reference to it's table
-// ColumnReferences are relatively inexpensive, being only a set of pointers that are guaranteed
-// to be well aligned for the backing type
-#[repr(transparent)]
-pub struct ColumnPtr<'a>(PhantomData<&'a mut RawTable>, Box<[NonNull<u8>]>);
-
-pub trait Bundle {
-    fn metadata() -> BundleMetadata;
-    unsafe fn move_to(self, data: RowInfo);
-}
-
-pub trait BundleRef: Bundle{
-    type RefType;
-    unsafe fn get<'a>(data: &'a RowInfo) -> Self::RefType;
-}
-
-pub trait BundleMut: BundleRef {
-    unsafe fn get_mut<'a>(data: &'a mut RowInfo) -> Self::RefType;
 }

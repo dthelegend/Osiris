@@ -4,7 +4,7 @@ use frunk::{HCons, HNil};
 use std::alloc::GlobalAlloc;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
-use crate::storage::type_data::TypeMetadata;
+use crate::storage::type_data::{DynamicBundle, TypeMetadata};
 
 mod type_data;
 mod raw_table;
@@ -28,20 +28,21 @@ impl Table {
     }
 
     // Add an element to the table
-    unsafe fn push_back_raw_unchecked<Iterable: Iterator<Item = NonNull<u8>>>(&mut self, data: Iterable)
-    where <Iterable as IntoIterator>::IntoIter: ExactSizeIterator {
-        self.buf.reserve(self.len + 1);
-        unsafe {
-            self.buf.write_raw_unchecked(self.len, data);
-        }
+    fn push_back(&mut self, data: impl DynamicBundle) {
+        unsafe { self.buf.dynamic_assign(self.len, data); }
         self.len += 1;
+    }
+
+    fn emplace(&mut self, idx: usize, data: impl DynamicBundle) {
+        assert!(idx < self.len);
+        unsafe { self.buf.drop_column(idx) }
     }
     
     pub fn pop(&mut self) {
         assert!(self.len > 0);
         self.len -= 1;
         unsafe {
-            self.buf.drop_unchecked(self.len);
+            self.buf.drop_column(self.len);
         }
     }
 }
