@@ -4,6 +4,7 @@ use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 use std::ops::{Deref, DerefMut};
+use frunk::labelled::chars::u;
 use crate::storage::type_data::{DynamicBundle, TypeMetadata};
 
 pub struct RawTable {
@@ -19,6 +20,14 @@ impl RawTable {
             data: NonNull::dangling(),
             capacity: 0,
             rows: RowInfo::new(type_infos)
+        }
+    }
+
+    pub fn new_unchecked(type_infos: impl IntoIterator<Item = TypeMetadata>) -> Self {
+        Self {
+            data: NonNull::dangling(),
+            capacity: 0,
+            rows: RowInfo::new_unchecked(type_infos)
         }
     }
 
@@ -83,26 +92,51 @@ impl RawTable {
         self.rows.search_dynamic(type_id)
     }
 
-    // Column-based access is slow and this cost should
-    pub unsafe fn dynamic_assign(&self, idx: usize, bundle: impl DynamicBundle) {
-        bundle.put(|src_ptr, src_id| {
-            if let Some((TypeMetadata { layout, .. }, data_ptr)) = self.dynamic_row_ptr(src_id) {
-                std::ptr::copy(src_ptr, data_ptr.add(layout.pad_to_align().size() * idx).as_ptr(), layout.size());
-            }
-        });
+    pub unsafe fn row_iter_for_column(&self, idx: usize) -> impl Iterator<Item = (TypeMetadata, *mut u8)> {
+        self.rows.iter().map(| &(metadata, ref ptr) | (metadata, ptr.as_ptr()))
     }
 
     pub unsafe fn drop_column(&self, idx: usize) {
         for (TypeMetadata { layout, drop, .. }, data_ptr) in self.rows.iter() {
-            drop(data_ptr.add(layout.pad_to_align().size() * idx).as_ptr())
+            unsafe { drop(data_ptr.add(layout.pad_to_align().size() * idx).as_ptr()) }
         }
     }
 
-    pub unsafe fn swap_columns(&self, idx_a: usize, idx_b: usize) {}
+    pub unsafe fn swap_columns(&self, idx_a: usize, idx_b: usize) {
+        if idx_a != idx_b {
+            for (TypeMetadata { layout, .. }, data_ptr) in self.rows.iter() {
+                unsafe {
+                    let ptr_a = data_ptr.add(layout.pad_to_align().size() * idx_a);
+                    let ptr_b = data_ptr.add(layout.pad_to_align().size() * idx_b);
+                    std::ptr::swap_nonoverlapping(ptr_a.as_ptr(), ptr_b.as_ptr(), layout.size());
+                }
+            }
+        }
+    }
+
+    pub unsafe fn clear(&mut self) {
+        let data = std::mem::replace(&mut self.data, NonNull::dangling());
+        let mut current_layout = Layout::new::<()>();
+
+        for (TypeMetadata { layout, .. }, ptr) in self.rows.iter_mut() {
+            (current_layout, _) = layout.repeat(self.capacity).and_then(|(array_layout, _stride)| layout.extend(array_layout))
+                .expect("Could not construct current layout");
+            *ptr = layout.dangling();
+        }
+        current_layout = current_layout.pad_to_align();
+        self.capacity = 0;
+        if current_layout.size() > 0 { dealloc(data.as_ptr(), current_layout); }
+    }
 
     pub fn capacity(&self) -> usize {
         self.capacity
     }
+}
+
+struct ColumnIter<'a> {
+    _marker: PhantomData<&'a RawTable>,
+    rows: Box<[(TypeMetadata, NonNull<u8>)]>,
+    remaining_len: usize,
 }
 
 impl Drop for RawTable {
@@ -121,17 +155,32 @@ impl Drop for RawTable {
     }
 }
 
+
 #[repr(transparent)]
+#[derive(Clone)]
 pub struct RowInfo(Box<[(TypeMetadata, NonNull<u8>)]>);
 
 impl RowInfo {
-    pub fn new(mut type_metadata: impl IntoIterator<Item = TypeMetadata>) -> Self {
+    pub fn new(type_metadata: impl IntoIterator<Item = TypeMetadata>) -> Self {
         let mut inner: Box<[(TypeMetadata, NonNull<u8>)]> = type_metadata.into_iter().map(|metadata| {
             let ptr = metadata.layout.dangling();
             (metadata, ptr)
         }).collect();
-        inner.sort_unstable_by_key(|(metadata, _)| metadata.id);
+        inner.sort_unstable_by_key(|&(metadata, _)| metadata);
+        assert!({
+            // assert all items are unique
+            inner.windows(2).all(|w| w[0] != w[1])
+        }, "All item types in a row must be unique!");
         Self(inner)
+    }
+
+    pub fn new_unchecked(type_metadata: impl IntoIterator<Item = TypeMetadata>) -> Self {
+        Self(
+            type_metadata.into_iter().map(|metadata| {
+                let ptr = metadata.layout.dangling();
+                (metadata, ptr)
+            }).collect()
+        )
     }
 
     pub fn search_dynamic(&self, type_id: TypeId) -> Option<(TypeMetadata, NonNull<u8>)> {
@@ -140,10 +189,6 @@ impl RowInfo {
 
     pub fn search<T: 'static>(&self) -> Option<(TypeMetadata, NonNull<u8>)> {
         self.search_dynamic(TypeId::of::<T>())
-    }
-
-    pub fn is_equivalent(&self, other: impl IntoIterator<Item=TypeMetadata>) -> bool {
-        other
     }
 }
 

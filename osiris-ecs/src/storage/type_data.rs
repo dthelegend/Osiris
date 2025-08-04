@@ -1,7 +1,7 @@
 use std::alloc::Layout;
 use std::any::TypeId;
-use std::ptr::NonNull;
-use frunk::labelled::chars::T;
+use std::cmp::Ordering;
+use std::mem::MaybeUninit;
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub struct TypeMetadata {
@@ -25,23 +25,47 @@ impl TypeMetadata {
     }
 }
 
-// A bundle represents something that can be put into a table
-pub trait DynamicBundle {
-    // iterator of the ids contained within this bundle
-    fn ids() -> impl IntoIterator<Item=TypeMetadata>;
-    fn put(self, f: impl Fn(*mut u8, TypeId));
+impl PartialOrd for TypeMetadata {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.id.partial_cmp(&other.id)
+    }
 }
 
-impl <A: 'static + Sized> DynamicBundle for (A,) {
-    fn ids() -> impl IntoIterator<Item=TypeMetadata> {
-        [TypeMetadata::of::<A>()]
+impl Ord for TypeMetadata {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.id.cmp(&other.id)
+    }
+}
+
+// A bundle represents something that can be put into a table
+pub unsafe trait DynamicBundle {
+    // iterator of the ids contained within this bundle
+    fn type_ids() -> impl IntoIterator<Item=TypeMetadata>;
+    unsafe fn put(self, f: impl FnMut(*mut u8, TypeId));
+    unsafe fn take(f: impl FnMut(*mut u8, TypeId)) -> Self;
+}
+
+unsafe impl <A: 'static + Sized> DynamicBundle for (A,) {
+    fn type_ids() -> impl IntoIterator<Item=TypeMetadata> {
+        let mut x = [TypeMetadata::of::<A>()];
+        x.sort_unstable();
+        x
     }
 
-    fn put(mut self, f: impl Fn(*mut u8, TypeId)) {
-        f((&mut self.0 as *mut A).cast::<u8>(), TypeId::of::<T>());
+    unsafe fn put(mut self, mut f: impl FnMut(*mut u8, TypeId)) {
+        f((&mut self.0 as *mut A).cast::<u8>(), TypeId::of::<A>());
         std::mem::forget(self.0);
     }
+
+    unsafe fn take(mut f: impl FnMut(*mut u8, TypeId)) -> Self {
+        let mut raw = MaybeUninit::<A>::uninit();
+        f(raw.as_mut_ptr().cast(), TypeId::of::<A>());
+        (raw.assume_init(),)
+    }
 }
 
+// Replace this with a trait alias when possible
+pub trait DynamicBundleIter : Iterator<Item: DynamicBundle> {
+}
 
-
+impl <T : Iterator<Item:DynamicBundle>> DynamicBundleIter for T {}
