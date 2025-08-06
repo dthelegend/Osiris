@@ -1,3 +1,4 @@
+use frunk::labelled::chars::B;
 use crate::storage::raw_table::RawTable;
 use crate::storage::type_data::{DynamicBundle, DynamicBundleIter, TypeMetadata};
 
@@ -43,11 +44,17 @@ impl Table {
     }
 
     // --- SINGLE OPERATIONS --- //
+    
+    fn is_bundle_compatible<B: DynamicBundle>(&self) -> bool {
+        self.buf.type_ids().zip(B::type_ids()).all(| (a, b )| a == b)
+    }
 
-    // bundle operation primitives
-    unsafe fn put_column<B: DynamicBundle>(&mut self, idx: usize, data: B) {
+    // unchecked bundle operation primitive
+    unsafe fn put_column_unchecked<B: DynamicBundle>(&self, idx: usize, data: B) {
         unsafe {
-            let mut column = self.buf.row_iter_for_column(idx);
+            self.buf.put_column(idx, |dst_ptr, id| {
+
+            });
             data.put(| src_ptr, src_id | {
                 let (TypeMetadata { id: dst_id, layout, ..} , dst_ptr) = column.next().expect("Compatible Bundles must have same number of type ids as table");
                 assert_eq!(src_id, dst_id, "Compatible bundles must have types identically ordered");
@@ -56,10 +63,10 @@ impl Table {
         }
     }
 
-    // bundle operation primitives
-    unsafe fn take_column<B: DynamicBundle>(&mut self, idx: usize) -> B {
+    // unchecked bundle operation primitive
+    unsafe fn take_column_unchecked<B: DynamicBundle>(&self, idx: usize) -> B {
         unsafe {
-            let mut column = self.buf.row_iter_for_column(idx);
+            let mut column = self.buf.with(idx);
             B::take(| dst_ptr, dst_id | {
                 let (TypeMetadata { id: src_id, layout, ..} , src_ptr) = column.next().expect("Bundle must have same type ids as table");
                 assert_eq!(src_id, dst_id, "Compatible bundles must have types identically ordered");
@@ -69,19 +76,25 @@ impl Table {
     }
 
     // Add an element to the table
-    pub fn push(&mut self, data: impl DynamicBundle) {
+    unsafe fn push_unchecked<B: DynamicBundle>(&mut self, data: B) {
         self.reserve(self.len + 1);
 
-        unsafe { self.put_column(self.len, data); }
+        unsafe { self.put_column_unchecked(self.len, data); }
 
         self.len += 1;
     }
 
+    pub fn push<B: DynamicBundle>(&mut self, data: B) {
+        assert!(self.is_bundle_compatible::<B>());
+        unsafe { self.push_unchecked(data) }
+    }
+
     pub fn insert_at<B: DynamicBundle>(&mut self, idx: usize, data: B) -> B {
         assert!(idx < self.len);
+        assert!(self.is_bundle_compatible::<B>());
         unsafe {
-            let output = self.take_column(idx);
-            self.put_column(idx, data);
+            let output = self.take_column_unchecked(idx);
+            self.put_column_unchecked(idx, data);
             output
         }
     }
@@ -89,6 +102,7 @@ impl Table {
     // We let the outer scope drop this bundle
     fn swap_remove<B: DynamicBundle>(&mut self, idx: usize) -> B {
         assert!(idx < self.len);
+        assert!(self.is_bundle_compatible::<B>());
         // swap this and last item
         unsafe { self.buf.swap_columns(idx, self.len - 1) };
         // drop last item
@@ -97,13 +111,15 @@ impl Table {
 
     pub fn pop<B : DynamicBundle>(&mut self) -> B {
         assert!(self.len > 0);
+        assert!(self.is_bundle_compatible::<B>());
         self.len -= 1;
-        unsafe { self.take_column(self.len) }
+        unsafe { self.take_column_unchecked(self.len) }
     }
 
     // --- BATCH OPERATIONS --- //
     pub fn extend<I: IntoIterator>(&mut self, iter: I)
     where I::IntoIter: DynamicBundleIter {
+        assert!(self.is_bundle_compatible::<I::Item>());
         let iter = iter.into_iter();
         let add_size = match iter.size_hint() {
             (_, Some(upper)) => upper,
@@ -114,7 +130,7 @@ impl Table {
         self.reserve(self.len + add_size);
 
         for item in iter {
-            self.push(item);
+            unsafe { self.push_unchecked(item); }
         }
     }
 

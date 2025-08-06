@@ -87,13 +87,15 @@ impl RawTable {
         let old_data = std::mem::replace(&mut self.data, new_data);
         if old_layout.size() > 0 { unsafe { dealloc(old_data.as_ptr(), old_layout); } }
     }
-
-    fn dynamic_row_ptr(&self, type_id: TypeId) -> Option<(TypeMetadata, NonNull<u8>)> {
-        self.rows.search_dynamic(type_id)
+    
+    pub fn type_ids(&self) -> impl Iterator<Item = TypeId> {
+        self.rows.iter().map(|&(TypeMetadata{ id, .. }, _)| id)
     }
-
-    pub unsafe fn row_iter_for_column(&self, idx: usize) -> impl Iterator<Item = (TypeMetadata, *mut u8)> {
-        self.rows.iter().map(| &(metadata, ref ptr) | (metadata, ptr.as_ptr()))
+    
+    pub fn put_column(&self, idx: usize, mut f: impl FnMut(*mut u8, TypeId)) {
+        for (TypeMetadata { layout, id, .. }, data_ptr) in self.rows.iter() {
+            unsafe { f(data_ptr.add(layout.pad_to_align().size() * idx).as_mut(), *id) }
+        }
     }
 
     pub unsafe fn drop_column(&self, idx: usize) {
@@ -204,4 +206,10 @@ impl DerefMut for RowInfo {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
+}
+
+// TableViews are non-owning views of a table
+struct TableView<'a> {
+    _marker: PhantomData<&'a RawTable>,
+    row_info: RowInfo
 }

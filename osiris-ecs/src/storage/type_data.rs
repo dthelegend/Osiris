@@ -40,14 +40,14 @@ impl Ord for TypeMetadata {
 // A bundle represents something that can be put into a table
 pub unsafe trait DynamicBundle {
     // iterator of the ids contained within this bundle
-    fn type_ids() -> impl IntoIterator<Item=TypeMetadata>;
+    fn type_ids() -> impl IntoIterator<Item=TypeId>;
     unsafe fn put(self, f: impl FnMut(*mut u8, TypeId));
     unsafe fn take(f: impl FnMut(*mut u8, TypeId)) -> Self;
 }
 
 unsafe impl <A: 'static + Sized> DynamicBundle for (A,) {
-    fn type_ids() -> impl IntoIterator<Item=TypeMetadata> {
-        let mut x = [TypeMetadata::of::<A>()];
+    fn type_ids() -> impl IntoIterator<Item=TypeId> {
+        let mut x = [TypeId::of::<A>()];
         x.sort_unstable();
         x
     }
