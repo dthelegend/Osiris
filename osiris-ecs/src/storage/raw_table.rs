@@ -1,11 +1,8 @@
+use crate::storage::type_data::TypeMetadata;
 use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
 use std::any::TypeId;
-use std::marker::PhantomData;
-use std::mem::MaybeUninit;
-use std::ptr::NonNull;
 use std::ops::{Deref, DerefMut};
-use frunk::labelled::chars::u;
-use crate::storage::type_data::{DynamicBundle, TypeMetadata};
+use std::ptr::NonNull;
 
 pub struct RawTable {
     data: NonNull<u8>,
@@ -85,17 +82,38 @@ impl RawTable {
             *ptr = ptr_in_new_data;
         }
         let old_data = std::mem::replace(&mut self.data, new_data);
+        self.capacity += additional_capacity;
         if old_layout.size() > 0 { unsafe { dealloc(old_data.as_ptr(), old_layout); } }
     }
     
-    pub fn type_ids(&self) -> impl Iterator<Item = TypeId> {
-        self.rows.iter().map(|&(TypeMetadata{ id, .. }, _)| id)
+    pub fn type_metadata(&self) -> impl Iterator<Item = TypeMetadata> {
+        self.rows.iter().map(|&(metadata, _)| metadata)
     }
     
-    pub fn put_column(&self, idx: usize, mut f: impl FnMut(*mut u8, TypeId)) {
-        for (TypeMetadata { layout, id, .. }, data_ptr) in self.rows.iter() {
-            unsafe { f(data_ptr.add(layout.pad_to_align().size() * idx).as_mut(), *id) }
+    pub fn column_iter(&self, idx: usize) -> impl Iterator<Item=(TypeMetadata, *mut u8)> {
+        assert!(idx < self.capacity);
+        self.rows.iter().cloned().map(move | (metadata@TypeMetadata { layout, .. }, data_ptr) | (metadata, unsafe { data_ptr.add(layout.pad_to_align().size() * idx).as_ptr() }))
+    }
+
+    pub fn column_iter_range(&self, start: usize, mut len: usize) -> impl Iterator<Item: Iterator<Item=(TypeMetadata, *mut u8)>> {
+        assert!(start + len <= self.capacity);
+        let mut row_iter : Box<[_]> = self.column_iter(start).collect();
+        for (TypeMetadata { layout, .. }, data_ptr) in row_iter.iter_mut() {
+            *data_ptr = unsafe { data_ptr.add(layout.pad_to_align().size() * start) };
         }
+
+        std::iter::from_fn(move || {
+            if len == 0 {
+                None
+            } else {
+                len -= 1;
+                let output = row_iter.clone().into_iter();
+                for (TypeMetadata { layout, .. }, data_ptr) in row_iter.iter_mut() {
+                    *data_ptr = unsafe { data_ptr.add(layout.pad_to_align().size()) };
+                }
+                Some(output)
+            }
+        })
     }
 
     pub unsafe fn drop_column(&self, idx: usize) {
@@ -121,7 +139,7 @@ impl RawTable {
         let mut current_layout = Layout::new::<()>();
 
         for (TypeMetadata { layout, .. }, ptr) in self.rows.iter_mut() {
-            (current_layout, _) = layout.repeat(self.capacity).and_then(|(array_layout, _stride)| layout.extend(array_layout))
+            (current_layout, _) = layout.repeat(self.capacity).and_then(|(array_layout, _stride)| current_layout.extend(array_layout))
                 .expect("Could not construct current layout");
             *ptr = layout.dangling();
         }
@@ -135,18 +153,12 @@ impl RawTable {
     }
 }
 
-struct ColumnIter<'a> {
-    _marker: PhantomData<&'a RawTable>,
-    rows: Box<[(TypeMetadata, NonNull<u8>)]>,
-    remaining_len: usize,
-}
-
 impl Drop for RawTable {
     fn drop(&mut self) {
         let mut final_layout = Layout::new::<()>();
 
         for (TypeMetadata { layout, .. }, .. ) in self.rows.iter() {
-            (final_layout, _) = layout.repeat(self.capacity).and_then(|(array_layout, _stride)| layout.extend(array_layout))
+            (final_layout, _) = layout.repeat(self.capacity).and_then(|(array_layout, _stride)| final_layout.extend(array_layout))
                 .expect("Could not construct old layout");
         }
 
@@ -186,7 +198,7 @@ impl RowInfo {
     }
 
     pub fn search_dynamic(&self, type_id: TypeId) -> Option<(TypeMetadata, NonNull<u8>)> {
-        self.0.binary_search_by_key(&type_id, |(metadata, ptr)| metadata.id).ok().map(|idx| self.0[idx])
+        self.0.binary_search_by_key(&type_id, |(metadata, _ptr)| metadata.id).ok().map(|idx| self.0[idx])
     }
 
     pub fn search<T: 'static>(&self) -> Option<(TypeMetadata, NonNull<u8>)> {
@@ -206,10 +218,4 @@ impl DerefMut for RowInfo {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
-}
-
-// TableViews are non-owning views of a table
-struct TableView<'a> {
-    _marker: PhantomData<&'a RawTable>,
-    row_info: RowInfo
 }

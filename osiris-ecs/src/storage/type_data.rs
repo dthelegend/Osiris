@@ -3,7 +3,7 @@ use std::any::TypeId;
 use std::cmp::Ordering;
 use std::mem::MaybeUninit;
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct TypeMetadata {
     pub id: TypeId,
     pub layout: Layout,
@@ -25,6 +25,15 @@ impl TypeMetadata {
     }
 }
 
+impl PartialEq<Self> for TypeMetadata {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for TypeMetadata {
+}
+
 impl PartialOrd for TypeMetadata {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         self.id.partial_cmp(&other.id)
@@ -40,14 +49,14 @@ impl Ord for TypeMetadata {
 // A bundle represents something that can be put into a table
 pub unsafe trait DynamicBundle {
     // iterator of the ids contained within this bundle
-    fn type_ids() -> impl IntoIterator<Item=TypeId>;
+    fn type_metadata() -> impl IntoIterator<Item=TypeMetadata>;
     unsafe fn put(self, f: impl FnMut(*mut u8, TypeId));
     unsafe fn take(f: impl FnMut(*mut u8, TypeId)) -> Self;
 }
 
 unsafe impl <A: 'static + Sized> DynamicBundle for (A,) {
-    fn type_ids() -> impl IntoIterator<Item=TypeId> {
-        let mut x = [TypeId::of::<A>()];
+    fn type_metadata() -> impl IntoIterator<Item=TypeMetadata> {
+        let mut x = [TypeMetadata::of::<A>(),];
         x.sort_unstable();
         x
     }
@@ -63,9 +72,3 @@ unsafe impl <A: 'static + Sized> DynamicBundle for (A,) {
         (raw.assume_init(),)
     }
 }
-
-// Replace this with a trait alias when possible
-pub trait DynamicBundleIter : Iterator<Item: DynamicBundle> {
-}
-
-impl <T : Iterator<Item:DynamicBundle>> DynamicBundleIter for T {}
