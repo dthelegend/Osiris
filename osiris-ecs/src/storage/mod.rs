@@ -4,6 +4,7 @@ use crate::storage::type_data::{DynamicBundle, TypeMetadata};
 mod type_data;
 mod raw_table;
 mod test;
+mod query;
 
 // We can't quite type mark this because we need to be able to construct a homogenous list of Tables :(
 struct Table {
@@ -27,7 +28,7 @@ impl Table {
         }
     }
 
-    pub fn from_iter<I: IntoIterator<Item: DynamicBundle>>(iter: I) -> Self {
+    pub fn from_iter<I: IntoIterator<Item: DynamicBundle, IntoIter: ExactSizeIterator<Item: DynamicBundle>>>(iter: I) -> Self {
         let mut init = Self::new_for_bundle::<I::Item>();
         init.extend(iter);
         init
@@ -86,7 +87,7 @@ impl Table {
     }
 
     // unchecked bundle operation primitive
-    unsafe fn put_column_from_iter_unchecked(&self, idx: usize, columns: impl IntoIterator<Item: DynamicBundle>) -> usize {
+    unsafe fn put_column_from_iter_unchecked(&self, idx: usize, columns: impl IntoIterator<Item: DynamicBundle, IntoIter: ExactSizeIterator<Item: DynamicBundle>>) -> usize {
         let mut count = 0;
         for (data, mut column) in std::iter::zip(columns.into_iter(), self.buf.column_iter_range(idx, self.capacity() - idx)) {
             unsafe {
@@ -121,13 +122,25 @@ impl Table {
     }
 
     // We let the outer scope drop this bundle
-    pub fn swap_remove<B: DynamicBundle>(&mut self, idx: usize) -> B {
+    pub fn swap_pop<B: DynamicBundle>(&mut self, idx: usize) -> B {
         assert!(idx < self.len);
         assert!(self.is_bundle_compatible::<B>());
         // swap this and last item
         unsafe { self.buf.swap_columns(idx, self.len - 1) };
         // drop last item
         self.pop()
+    }
+
+    // We drop internally
+    pub fn swap_remove(&mut self, idx: usize) {
+        assert!(idx < self.len);
+        self.len -= 1;
+        unsafe {
+            // swap this and last item
+            self.buf.swap_columns(idx, self.len);
+            // drop last item
+            self.buf.drop_column(self.len);
+        }
     }
 
     pub fn pop<B : DynamicBundle>(&mut self) -> B {
@@ -138,7 +151,7 @@ impl Table {
     }
 
     // --- BATCH OPERATIONS --- //
-    pub fn extend<I: IntoIterator<Item: DynamicBundle>>(&mut self, iter: I) {
+    pub fn extend<I: IntoIterator<Item: DynamicBundle, IntoIter: ExactSizeIterator<Item: DynamicBundle>>>(&mut self, iter: I) {
         assert!(self.is_bundle_compatible::<I::Item>(), "Incompatible bundles used!");
         let mut iter = iter.into_iter();
         let add_size = match iter.size_hint() {
@@ -170,8 +183,19 @@ impl Table {
         self.extend((0..n).map(|_| prototype.clone()))
     }
 
-    pub fn remove_if<B: DynamicBundle>(&mut self, pred: impl Fn(&B) -> bool) {
-        todo!()
+    // Add and use query once available
+    // pub fn remove_if<B: DynamicBundle>(&self, mut pred: impl FnMut(usize, &B) -> bool) {
+    //     todo!()
+    // }
+
+    pub fn erase(&self, idx: usize, count: usize) {
+        assert!(idx + count < self.len());
+
+        for drop_idx in idx..(idx + count) {
+            unsafe { self.buf.drop_column(drop_idx) }
+        }
+
+        unsafe { self.buf.move_columns(idx + count, self.len - (idx + count), idx) }
     }
 }
 
@@ -180,4 +204,3 @@ impl Drop for Table {
         for i in 0..self.len { unsafe { self.buf.drop_column(i) } }
     }
 }
-

@@ -134,6 +134,18 @@ impl RawTable {
         }
     }
 
+    pub unsafe fn move_columns(&self, src_start: usize, src_len: usize, dst_start: usize) {
+        if src_start != dst_start {
+            for (TypeMetadata { layout, .. }, data_ptr) in self.rows.iter() {
+                unsafe {
+                    let src_ptr = data_ptr.add(layout.pad_to_align().size() * src_start);
+                    let dst_ptr = data_ptr.add(layout.pad_to_align().size() * dst_start);
+                    std::ptr::copy(src_ptr.as_ptr(), dst_ptr.as_ptr(), layout.pad_to_align().size() * src_len);
+                }
+            }
+        }
+    }
+
     pub unsafe fn clear(&mut self) {
         let data = std::mem::replace(&mut self.data, NonNull::dangling());
         let mut current_layout = Layout::new::<()>();

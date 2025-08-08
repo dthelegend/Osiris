@@ -2,6 +2,7 @@ use std::alloc::Layout;
 use std::any::TypeId;
 use std::cmp::Ordering;
 use std::mem::MaybeUninit;
+use paste::paste;
 
 #[derive(Copy, Clone, Debug)]
 pub struct TypeMetadata {
@@ -54,21 +55,57 @@ pub unsafe trait DynamicBundle {
     unsafe fn take(f: impl FnMut(*mut u8, TypeId)) -> Self;
 }
 
-unsafe impl <A: 'static + Sized> DynamicBundle for (A,) {
-    fn type_metadata() -> impl IntoIterator<Item=TypeMetadata> {
-        let mut x = [TypeMetadata::of::<A>(),];
-        x.sort_unstable();
-        x
-    }
+macro_rules! tuple_bundle_impl {
+    ($($tuple_types:ty),*) => {
+        paste! {
+            unsafe impl <$($tuple_types: 'static + Sized),*> DynamicBundle for ($($tuple_types,)*)
+            where ($($tuple_types,)*): Sized {
+                fn type_metadata() -> impl IntoIterator<Item=TypeMetadata> {
+                    let mut x = [$(TypeMetadata::of::<$tuple_types>()),*];
+                    x.sort_unstable();
+                    x
+                }
 
-    unsafe fn put(mut self, mut f: impl FnMut(*mut u8, TypeId)) {
-        f((&mut self.0 as *mut A).cast::<u8>(), TypeId::of::<A>());
-        std::mem::forget(self.0);
-    }
+                unsafe fn put(mut self, mut f: impl FnMut(*mut u8, TypeId)) {
+                    let ($([< raw_ $tuple_types:snake >],)*) = &mut self;
+                    let mut x = [$((([< raw_ $tuple_types:snake >] as *mut $tuple_types).cast::<u8>(), TypeId::of::<$tuple_types>())),*];
+                    x.sort_unstable_by_key(|(_,id)| *id);
+                    for (a, b) in x.into_iter() {
+                        f(a, b);
+                    }
+                    std::mem::forget(self);
+                }
 
-    unsafe fn take(mut f: impl FnMut(*mut u8, TypeId)) -> Self {
-        let mut raw = MaybeUninit::<A>::uninit();
-        f(raw.as_mut_ptr().cast(), TypeId::of::<A>());
-        (raw.assume_init(),)
-    }
+                unsafe fn take(mut f: impl FnMut(*mut u8, TypeId)) -> Self {
+                    let mut raw = ($(MaybeUninit::<$tuple_types>::uninit(),)*);
+                    let ($([< raw_ $tuple_types:snake >],)*) = &mut raw;
+                    let mut refs = [
+                        $(
+                        {
+                            ([< raw_ $tuple_types:snake >].as_mut_ptr().cast(), TypeId::of::<$tuple_types>())
+                        }
+                        ),*
+                    ];
+                    refs.sort_unstable_by_key(|(_,id)| *id);
+                    for (a, b) in refs.into_iter() {
+                        f(a, b);
+                    }
+                    // NB: Since raw is maybe uninit we don't need to drop it
+                    unsafe { std::mem::transmute_copy::<_,Self>(&raw) }
+                }
+            }
+        }
+    };
 }
+
+macro_rules! all_tuple_impl_for {
+    ($single:ty) => {
+        tuple_bundle_impl!($single);
+    };
+    ($single:ty, $($list:ty),+) => {
+        tuple_bundle_impl!($single, $($list),+);
+        all_tuple_impl_for!($($list),+);
+    };
+}
+
+all_tuple_impl_for!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z);
